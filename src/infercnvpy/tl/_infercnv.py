@@ -11,8 +11,10 @@ from anndata import AnnData
 from scanpy import logging
 from tqdm.auto import tqdm
 from tqdm.contrib.concurrent import process_map
+from scipy.sparse import issparse
 
 from infercnvpy._util import _ensure_array
+from infercnvpy.io import read_breakpoints
 
 
 def infercnv(
@@ -32,6 +34,9 @@ def infercnv(
     layer: str | None = None,
     key_added: str = "cnv",
     calculate_gene_values: bool = False,
+    breakpoint_file: str | None = None,
+    min_genes_per_segment: int | None = None,
+    add_segment_id_to_var: bool = False,
 ) -> None | tuple[dict, scipy.sparse.csr_matrix, np.ndarray | None]:
     """Infer Copy Number Variation (CNV) by averaging gene expression over genomic regions.
 
@@ -87,6 +92,14 @@ def infercnv(
         Additionally not all genes will be included in the per gene CNV, due to the window size and step size not always being a multiple of
         the number of genes. Any genes not included in the per gene CNV will be filled with NaN.
         Note this will significantly increase the memory and computation time, it is recommended to decrease the chunksize to ~100 if this is set to True.
+    breakpoint_file
+        Path to a file with breakpoint data. If provided, the CNV inference will be based on the segments defined in this file.
+        The file should be a tab-separated file with the following columns: `chromosome`, `start`, `end`, `segment_id`.
+    min_genes_per_segment
+        If `breakpoint_file` is provided, segments with fewer than this number of genes will be set to NaN.
+    add_segment_id_to_var
+        If True, and `breakpoint_file` is provided, add a `segment` column to `adata.var` 
+        that maps each gene to its segment.
 
 
     Returns
@@ -108,6 +121,38 @@ def infercnv(
         var_mask = var_mask | adata.var["chromosome"].isin(exclude_chromosomes)
 
     tmp_adata = adata[:, ~var_mask]
+
+    if breakpoint_file is not None:
+        breakpoints = read_breakpoints(breakpoint_file)
+        if "segment_id" not in breakpoints.columns:
+            breakpoints["segment_id"] = (
+                breakpoints["seg_chr"].astype(str)
+                + ":"
+                + breakpoints["seg_start"].astype(str)
+                + "-"
+                + breakpoints["seg_end"].astype(str)
+            )
+        breakpoints = breakpoints.drop_duplicates(subset=["seg_chr", "seg_start", "seg_end"])
+
+        # Filter breakpoints to only include chromosomes present in the data
+        chromosomes_in_data = [
+            x for x in tmp_adata.var["chromosome"].unique() if isinstance(x, str) and x.startswith("chr") and x != "chrM"
+        ]
+        breakpoints = breakpoints[breakpoints["seg_chr"].isin(chromosomes_in_data)]
+
+    else:
+        breakpoints = None
+
+    if add_segment_id_to_var and breakpoints is not None:
+        adata.var["segment"] = None
+        for i, segment in breakpoints.iterrows():
+            genes_in_segment = (
+                (adata.var["chromosome"] == segment["seg_chr"])
+                & (adata.var["start"] >= segment["seg_start"])
+                & (adata.var["end"] <= segment["seg_end"])
+            )
+            adata.var.loc[genes_in_segment, "segment"] = segment["segment_id"]
+
     reference = _get_reference(adata, reference_key, reference_cat, reference, layer)[:, ~var_mask]
 
     expr = tmp_adata.X if layer is None else tmp_adata.layers[layer]
@@ -128,6 +173,8 @@ def infercnv(
             itertools.repeat(step),
             itertools.repeat(dynamic_threshold),
             itertools.repeat(calculate_gene_values),
+            itertools.repeat(breakpoints),
+            itertools.repeat(min_genes_per_segment),
             tqdm_class=tqdm,
             max_workers=cpu_count() if n_jobs is None else n_jobs,
         ),
@@ -156,6 +203,44 @@ def infercnv(
 
         if calculate_gene_values:
             adata.layers[f"gene_values_{key_added}"] = per_gene_mtx
+
+        # Replace NaN with 0 for neighbor computation
+        if breakpoints is not None and min_genes_per_segment is not None:
+            X = adata.obsm[f"X_{key_added}"]
+            if issparse(X):
+                X = X.toarray()
+
+            # find columns that are all nan, which correspond to segments with too few genes
+            nan_cols = np.all(np.isnan(X), axis=0)
+
+            if np.any(nan_cols):
+                # get the segment ids for these columns
+                # The columns of the result matrix are sorted by chromosome (natural sort)
+                # and then by segment start position. We need to sort the breakpoints dataframe
+                # in the same way to map the column indices to segment IDs.
+                sorted_chromosomes = _natural_sort(
+                    [x for x in tmp_adata.var["chromosome"].unique() if x.startswith("chr") and x != "chrM"]
+                )
+
+                # The read_breakpoints function is expected to return a dataframe with
+                # 'seg_chr', 'seg_start', and 'segment_id' columns.
+                breakpoints["seg_chr_cat"] = pd.Categorical(
+                    breakpoints["seg_chr"], categories=sorted_chromosomes, ordered=True
+                )
+                sorted_breakpoints = breakpoints.sort_values(["seg_chr_cat", "seg_start"]).reset_index(drop=True)
+
+                # store the breakpoints dataframe
+                adata.uns[key_added]["breakpoints"] = sorted_breakpoints.to_dict("list")
+
+                # get the segment ids of the nan columns
+                low_gene_segment_ids = sorted_breakpoints.loc[nan_cols, "segment_id"].tolist()
+
+                # store the list of low-gene segments
+                adata.uns[key_added]["low_gene_segments"] = low_gene_segment_ids
+
+            # Replace NaN with 0 for neighbor computation
+            X[np.isnan(X)] = 0
+            adata.obsm[f"X_{key_added}"] = X
 
     else:
         return chr_pos, res, per_gene_mtx
@@ -344,13 +429,122 @@ def _running_mean_by_chromosome(
 
 
 def _running_mean_for_chromosome(chr, expr, var, window_size, step, calculate_gene_values):
-    genes = var.loc[var["chromosome"] == chr].sort_values("start").index.values
-    tmp_x = expr[:, var.index.get_indexer(genes)]
+    genes = var.loc[var["chromosome"] == chr].sort_values("start")
+    tmp_x = expr[:, var.index.get_indexer(genes.index)]
     x_conv, convolved_gene_values = _running_mean(
-        tmp_x, n=window_size, step=step, gene_list=genes, calculate_gene_values=calculate_gene_values
+        tmp_x, n=window_size, step=step, gene_list=genes.index.values, calculate_gene_values=calculate_gene_values
     )
 
     return x_conv, convolved_gene_values
+
+
+def _segment_mean(
+    x: np.ndarray | scipy.sparse.spmatrix,
+    segments: pd.DataFrame,
+    gene_list: pd.DataFrame,
+    min_genes_per_segment: int | None,
+    calculate_gene_values: bool = False,
+) -> tuple[np.ndarray, pd.DataFrame | None]:
+    """
+    Compute the mean expression for each segment.
+
+    Densifies the matrix.
+
+    Parameters
+    ----------
+    x
+        matrix to work on
+    segments
+        A DataFrame with segment information for a specific chromosome.
+    gene_list
+        A DataFrame with gene information (including start and end positions).
+    min_genes_per_segment
+        Minimum number of genes required for a segment to be considered valid.
+    calculate_gene_values
+        If True per gene CNVs will be calculated and stored in `adata.layers["gene_values_{key_added}"]`.
+    """
+    segment_means = []
+    for _, segment in segments.iterrows():
+        genes_in_segment = gene_list[
+            (gene_list["start"] >= segment["seg_start"]) & (gene_list["end"] <= segment["seg_end"])
+        ].index
+        if not genes_in_segment.any() or (min_genes_per_segment is not None and len(genes_in_segment) < min_genes_per_segment):
+            # Handle cases where a segment contains no genes or fewer than the minimum required
+            segment_means.append(np.full((x.shape[0], 1), np.nan))
+            continue
+        gene_indices = [gene_list.index.get_loc(gene) for gene in genes_in_segment]
+        segment_means.append(np.mean(x[:, gene_indices], axis=1, keepdims=True))
+
+    smoothed_x = np.hstack(segment_means)
+
+    if calculate_gene_values:
+        # For simplicity, we assign the segment mean to all genes in the segment.
+        # A more sophisticated approach could be implemented here.
+        convolved_gene_values = pd.DataFrame(index=np.arange(x.shape[0]), columns=gene_list.index)
+        for i, (_, segment) in enumerate(segments.iterrows()):
+            genes_in_segment = gene_list[
+                (gene_list["start"] >= segment["seg_start"]) & (gene_list["end"] <= segment["seg_end"])
+            ].index
+            for gene in genes_in_segment:
+                convolved_gene_values[gene] = smoothed_x[:, i]
+    else:
+        convolved_gene_values = None
+
+    return smoothed_x, convolved_gene_values
+
+
+def _segment_mean_by_chromosome(
+    expr, var, breakpoints, min_genes_per_segment, calculate_gene_values
+) -> tuple[dict, np.ndarray, pd.DataFrame | None]:
+    """Compute the segment mean for each chromosome independently. Stack the resulting arrays ordered by chromosome.
+
+    Parameters
+    ----------
+    expr
+        A gene expression matrix, appropriately preprocessed
+    var
+        The var data frame of the associated AnnData object
+    breakpoints
+        A DataFrame with breakpoint information.
+    min_genes_per_segment
+        Minimum number of genes required for a segment to be considered valid.
+    calculate_gene_values
+        If True per gene CNVs will be calculated.
+
+    Returns
+    -------
+    chr_start_pos
+        A Dictionary mapping each chromosome to the index of segment_mean where
+        this chromosome begins.
+    segment_mean
+        A numpy array with the smoothed gene expression, ordered by chromosome
+        and genomic position
+    """
+    chromosomes = _natural_sort([x for x in var["chromosome"].unique() if x.startswith("chr") and x != "chrM"])
+
+    segment_means = []
+    convolved_dfs = []
+    for chr in chromosomes:
+        genes = var.loc[var["chromosome"] == chr].sort_values("start")
+        tmp_x = expr[:, var.index.get_indexer(genes.index)]
+        
+        chr_breakpoints = breakpoints[breakpoints["seg_chr"] == chr]
+        
+        x_conv, convolved_gene_values = _segment_mean(
+            tmp_x, segments=chr_breakpoints, gene_list=genes, min_genes_per_segment=min_genes_per_segment, calculate_gene_values=calculate_gene_values
+        )
+        segment_means.append(x_conv)
+        convolved_dfs.append(convolved_gene_values)
+
+    chr_start_pos = {}
+    for chr, i in zip(chromosomes, np.cumsum([0] + [x.shape[1] for x in segment_means]), strict=False):
+        chr_start_pos[chr] = i
+
+    ## Concatenate the gene dfs
+    if calculate_gene_values:
+        convolved_dfs = pd.concat(convolved_dfs, axis=1)
+
+    return chr_start_pos, np.hstack(segment_means), convolved_dfs
 
 
 def _get_reference(
@@ -405,7 +599,7 @@ def _get_reference(
     return reference
 
 
-def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_threshold, calculate_gene_values=False):
+def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_threshold, calculate_gene_values=False, breakpoints=None, min_genes_per_segment=None):
     """The actual infercnv work is happening here.
 
     Process chunks of serveral thousand genes independently since this
@@ -431,20 +625,27 @@ def _infercnv_chunk(tmp_x, var, reference, lfc_cap, window_size, step, dynamic_t
     x_centered = _ensure_array(x_centered)
     # Step 2 - clip log fold changes
     x_clipped = np.clip(x_centered, -lfc_cap, lfc_cap)
+    
     # Step 3 - smooth by genomic position
-    chr_pos, x_smoothed, conv_df = _running_mean_by_chromosome(
-        x_clipped, var, window_size=window_size, step=step, calculate_gene_values=calculate_gene_values
-    )
+    if breakpoints is not None:
+        chr_pos, x_smoothed, conv_df = _segment_mean_by_chromosome(
+            x_clipped, var, breakpoints=breakpoints, min_genes_per_segment=min_genes_per_segment, calculate_gene_values=calculate_gene_values
+        )
+    else:
+        chr_pos, x_smoothed, conv_df = _running_mean_by_chromosome(
+            x_clipped, var, window_size=window_size, step=step, calculate_gene_values=calculate_gene_values
+        )
+        
     # Step 4 - center by cell
-    x_res = x_smoothed - np.median(x_smoothed, axis=1)[:, np.newaxis]
+    x_res = x_smoothed - np.nanmedian(x_smoothed, axis=1)[:, np.newaxis]
     if calculate_gene_values:
-        gene_res = conv_df - np.median(conv_df, axis=1)[:, np.newaxis]
+        gene_res = conv_df - np.nanmedian(conv_df, axis=1)[:, np.newaxis]
     else:
         gene_res = None
 
     # step 5 - standard deviation based noise filtering
     if dynamic_threshold is not None:
-        noise_thres = dynamic_threshold * np.std(x_res)
+        noise_thres = dynamic_threshold * np.nanstd(x_res)
         x_res[np.abs(x_res) < noise_thres] = 0
         if calculate_gene_values:
             gene_res[np.abs(gene_res) < noise_thres] = 0

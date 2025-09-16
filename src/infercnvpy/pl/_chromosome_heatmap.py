@@ -6,6 +6,7 @@ from anndata import AnnData
 from matplotlib.colors import Colormap, TwoSlopeNorm
 from scanpy.plotting._utils import savefig_or_show
 from scipy.sparse import issparse
+import matplotlib.cm as cm
 
 
 def chromosome_heatmap(
@@ -52,7 +53,22 @@ def chromosome_heatmap(
     """
     if groupby == "cnv_leiden" and "cnv_leiden" not in adata.obs.columns:
         raise ValueError("'cnv_leiden' is not in `adata.obs`. Did you run `tl.leiden()`?")
-    tmp_adata = AnnData(X=adata.obsm[f"X_{use_rep}"], obs=adata.obs, uns=adata.uns)
+    tmp_adata = AnnData(X=adata.obsm[f"X_{use_rep}"].copy(), obs=adata.obs, uns=adata.uns)
+
+    # set low-gene segments to nan
+    if "low_gene_segments" in adata.uns[use_rep] and "breakpoints" in adata.uns[use_rep]:
+        low_gene_segments = adata.uns[use_rep]["low_gene_segments"]
+        breakpoints_df = pd.DataFrame(adata.uns[use_rep]["breakpoints"])
+
+        # Get the indices of the low-gene segments
+        low_gene_indices = breakpoints_df[breakpoints_df["segment_id"].isin(low_gene_segments)].index
+
+        # Set the corresponding columns to NaN
+        if len(low_gene_indices) > 0:
+            # need to handle the case where X is sparse
+            if issparse(tmp_adata.X):
+                tmp_adata.X = tmp_adata.X.toarray()
+            tmp_adata.X[:, low_gene_indices] = np.nan
 
     # re-sort, as saving & loading anndata destroys the order
     chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
@@ -67,6 +83,10 @@ def chromosome_heatmap(
     if vmax is None:
         vmax = np.nanmax(tmp_data)
     kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
+
+    # set nan values to gray
+    cmap = cm.get_cmap(cmap).copy()
+    cmap.set_bad("lightgrey")
 
     # add chromosome annotations
     var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
@@ -84,7 +104,28 @@ def chromosome_heatmap(
         **kwargs,
     )
 
-    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=0, ymax=tmp_adata.shape[0])
+    ax = return_ax_dic["heatmap_ax"]
+    ax.vlines(np.array(chr_pos[1:]) - 0.5, lw=1.6, color='black', ymin=0, ymax=tmp_adata.shape[0])
+
+    if "breakpoints" in adata.uns[use_rep]:
+        breakpoints_df = pd.DataFrame(adata.uns[use_rep]["breakpoints"])
+
+        # Add vertical lines for segment boundaries
+        ax.vlines(np.arange(len(breakpoints_df)) + 0.5, ymin=0, ymax=tmp_adata.shape[0], lw=0.3, color="black")
+
+        # Add segment labels
+        n_segments = len(breakpoints_df)
+        if n_segments > 50:  # If there are many segments, label only a subset
+            step = n_segments // 20  # aim for ~20 labels
+            tick_positions = np.arange(0, n_segments, step)
+            tick_labels = breakpoints_df["segment_id"][::step]
+        else:
+            tick_positions = np.arange(n_segments)
+            tick_labels = breakpoints_df["segment_id"]
+
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=90, ha="center", size="small")
+        ax.tick_params(axis="x", length=2, pad=2)
 
     savefig_or_show("heatmap", show=show, save=save)
     show = sc.settings.autoshow if show is None else show
@@ -147,7 +188,7 @@ def chromosome_heatmap_summary(
     tmp_obs.index = tmp_obs.index.astype(str)
 
     def _get_group_mean(group):
-        group_mean = np.mean(adata.obsm[f"X_{use_rep}"][adata.obs[groupby].values == group, :], axis=0)
+        group_mean = np.nanmean(adata.obsm[f"X_{use_rep}"][adata.obs[groupby].values == group, :], axis=0)
         if len(group_mean.shape) == 1:
             # derived from an array instead of sparse matrix -> 1 dim instead of 2
             group_mean = group_mean[np.newaxis, :]
@@ -157,6 +198,21 @@ def chromosome_heatmap_summary(
         X=np.vstack([np.repeat(_get_group_mean(group), 10, axis=0) for group in groups]), obs=tmp_obs, uns=adata.uns
     )
 
+    # set low-gene segments to nan
+    if "low_gene_segments" in adata.uns[use_rep] and "breakpoints" in adata.uns[use_rep]:
+        low_gene_segments = adata.uns[use_rep]["low_gene_segments"]
+        breakpoints_df = pd.DataFrame(adata.uns[use_rep]["breakpoints"])
+
+        # Get the indices of the low-gene segments
+        low_gene_indices = breakpoints_df[breakpoints_df["segment_id"].isin(low_gene_segments)].index
+
+        # Set the corresponding columns to NaN
+        if len(low_gene_indices) > 0:
+            # need to handle the case where X is sparse
+            if issparse(tmp_adata.X):
+                tmp_adata.X = tmp_adata.X.toarray()
+            tmp_adata.X[:, low_gene_indices] = np.nan
+
     chr_pos_dict = dict(sorted(adata.uns[use_rep]["chr_pos"].items(), key=lambda x: x[1]))
     chr_pos = list(chr_pos_dict.values())
 
@@ -164,10 +220,14 @@ def chromosome_heatmap_summary(
     vmin = kwargs.pop("vmin", None)
     vmax = kwargs.pop("vmax", None)
     if vmin is None:
-        vmin = np.min(tmp_adata.X)
+        vmin = np.nanmin(tmp_adata.X)
     if vmax is None:
-        vmax = np.max(tmp_adata.X)
+        vmax = np.nanmax(tmp_adata.X)
     kwargs["norm"] = TwoSlopeNorm(0, vmin=vmin, vmax=vmax)
+
+    # set nan values to gray
+    cmap = cm.get_cmap(cmap).copy()
+    cmap.set_bad("lightgrey")
 
     # add chromosome annotations
     var_group_positions = list(zip(chr_pos, chr_pos[1:] + [tmp_adata.shape[1]], strict=False))
@@ -185,7 +245,28 @@ def chromosome_heatmap_summary(
         **kwargs,
     )
 
-    return_ax_dic["heatmap_ax"].vlines(chr_pos[1:], lw=0.6, ymin=-1, ymax=tmp_adata.shape[0])
+    ax = return_ax_dic["heatmap_ax"]
+    ax.vlines(np.array(chr_pos[1:]) - 0.5, lw=0.6, ymin=-1, ymax=tmp_adata.shape[0])
+
+    if "breakpoints" in adata.uns[use_rep]:
+        breakpoints_df = pd.DataFrame(adata.uns[use_rep]["breakpoints"])
+
+        # Add vertical lines for segment boundaries
+        ax.vlines(np.arange(len(breakpoints_df)) + 0.5, ymin=-1, ymax=tmp_adata.shape[0], lw=0.3, color="black")
+
+        # Add segment labels
+        n_segments = len(breakpoints_df)
+        if n_segments > 50:  # If there are many segments, label only a subset
+            step = n_segments // 20  # aim for ~20 labels
+            tick_positions = np.arange(0, n_segments, step)
+            tick_labels = breakpoints_df["segment_id"][::step]
+        else:
+            tick_positions = np.arange(n_segments)
+            tick_labels = breakpoints_df["segment_id"]
+
+        ax.set_xticks(tick_positions)
+        ax.set_xticklabels(tick_labels, rotation=90, ha="center", size="small")
+        ax.tick_params(axis="x", length=2, pad=2)
 
     savefig_or_show("heatmap", show=show, save=save)
     show = sc.settings.autoshow if show is None else show
